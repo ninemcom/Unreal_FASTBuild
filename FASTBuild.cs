@@ -18,7 +18,7 @@ namespace UnrealBuildTool
 		/*---- Configurable User settings ----*/
 
 		// Used to specify a non-standard location for the FBuild.exe, for example if you have not added it to your PATH environment variable.
-		public static string FBuildExePathOverride = "";
+		public static string FBuildExePathOverride = @"C:\FastBuild\FBuild.exe";
 
 		// Controls network build distribution
 		private bool bEnableDistribution = true;
@@ -28,7 +28,7 @@ namespace UnrealBuildTool
 
 		// Location of the shared cache, it could be a local or network path (i.e: @"\\DESKTOP-BEAST\FASTBuildCache").
 		// Only relevant if bEnableCaching is true;
-		private string CachePath = @"\\SharedDrive\FASTBuildCache";
+		private string CachePath = @"\\SoccerBuild\FastBuildShared\Cache";
 
 		public enum eCacheMode
 		{
@@ -90,7 +90,8 @@ namespace UnrealBuildTool
 		{
 			Windows,
 			XBOne,
-			PS4
+			PS4,
+			Android,
 		}
 
 		private FBBuildType BuildType = FBBuildType.Windows;
@@ -115,6 +116,11 @@ namespace UnrealBuildTool
 				else if (action.CommandPath.Contains("Microsoft")) //Not a great test.
 				{
 					BuildType = FBBuildType.Windows;
+					return;
+				}
+				else if (action.CommandArguments.Contains("Android"))
+				{
+					BuildType = FBBuildType.Android;
 					return;
 				}
 			}
@@ -342,6 +348,10 @@ namespace UnrealBuildTool
 			//The search for the input file... we take the first non-argument we can find
 			if (!SkipInputFile)
 			{
+				HashSet<string> TokensNeedArgument = new HashSet<string> {
+					"/I", "-I", "/l", "/D", "-D", "-x", "-include", "-std", "-march",
+					"-target", "--sysroot", "-gcc-toolchain", "-fdiagnostics-format",
+				};
 				for (int i = 0; i < ProcessedTokens.Count; ++i)
 				{
 					string Token = ProcessedTokens[i];
@@ -350,9 +360,26 @@ namespace UnrealBuildTool
 						continue;
 					}
 
-					if (Token == "/I" || Token == "/l" || Token == "/D" || Token == "-D" || Token == "-x" || Token == "-include") // Skip tokens with values, I for cpp includes, l for resource compiler includes
+					if (TokensNeedArgument.Contains(Token)) // Skip tokens with values, I for cpp includes, l for resource compiler includes
 					{
-						++i;
+						if (Token == "/I" || Token == "-I")
+						{
+							string Argument = ProcessedTokens[i + 1];
+							if (Argument.First() == '"' && Argument.Last() == '"')
+							{
+								ProcessedTokens[i] = string.Format("{0}{1}", Token, ProcessedTokens[i + 1]);
+							}
+							else
+							{
+								ProcessedTokens[i] = string.Format("{0}\"{1}\"", Token, ProcessedTokens[i + 1]);
+							}
+
+							ProcessedTokens.RemoveAt(i + 1);
+						}
+						else
+						{
+							++i;
+						}
 					}
 					else if (!Token.StartsWith("/") && !Token.StartsWith("-") && !Token.StartsWith("\"-"))
 					{
@@ -482,7 +509,7 @@ namespace UnrealBuildTool
 			return defaultValue.ToString();
 		}
 
-		private void WriteEnvironmentSetup()
+		private void WriteEnvironmentSetup(List<Action> Actions)
 		{
 			DirectoryReference VCInstallDir = null;
 			string VCToolPath64 = "";
@@ -500,8 +527,8 @@ namespace UnrealBuildTool
 				{
 					// If you have XboxOne source access, uncommenting the line below will be better for selecting the appropriate version of the compiler.
 					// Translate the XboxOne compiler to the right Windows compiler to set the VC environment vars correctly...
-					WindowsCompiler windowsCompiler = XboxOnePlatform.GetDefaultCompiler() == XboxOneCompiler.VisualStudio2015 ? WindowsCompiler.VisualStudio2015 : WindowsCompiler.VisualStudio2017;
-					VCEnv = VCEnvironment.Create(windowsCompiler, CppPlatform.Win64, null, null);
+					//WindowsCompiler windowsCompiler = XboxOnePlatform.GetDefaultCompiler() == XboxOneCompiler.VisualStudio2015 ? WindowsCompiler.VisualStudio2015 : WindowsCompiler.VisualStudio2017;
+					//VCEnv = VCEnvironment.Create(windowsCompiler, CppPlatform.Win64, null, null);
 				}
 			}
 			catch (Exception)
@@ -611,13 +638,37 @@ namespace UnrealBuildTool
 				{
 					//VS 2017 is really confusing in terms of version numbers and paths so these values might need to be modified depending on what version of the tool chain you
 					// chose to install.
-					AddText(string.Format("\t\t'{0}/VC/Redist/MSVC/14.13.26020/x64/Microsoft.VC141.CRT/msvcp{1}.dll'\n", VCInstallDir.ToString(), platformVersionNumber));
-					AddText(string.Format("\t\t'{0}/VC/Redist/MSVC/14.13.26020/x64/Microsoft.VC141.CRT/vccorlib{1}.dll'\n", VCInstallDir.ToString(), platformVersionNumber));
+					string RedistFilePath = string.Format("{0}/VC/Auxiliary/Build/Microsoft.VCRedistVersion.default.txt", VCInstallDir);
+					string RedistVersionNumber = File.ReadAllText(RedistFilePath).TrimEnd('\r', '\n');
+					AddText(string.Format("\t\t'{0}/VC/Redist/MSVC/{1}/x64/Microsoft.VC141.CRT/msvcp{2}.dll'\n", VCInstallDir.ToString(), RedistVersionNumber, platformVersionNumber));
+					AddText(string.Format("\t\t'{0}/VC/Redist/MSVC/{1}/x64/Microsoft.VC141.CRT/vccorlib{2}.dll'\n", VCInstallDir.ToString(), RedistVersionNumber, platformVersionNumber));
 				}
 
 				AddText("\t}\n"); //End extra files
 
 				AddText("}\n\n"); //End compiler
+			}
+			else if (BuildType == FBBuildType.Android)
+			{
+				string CompilerPath = null;
+				foreach (Action action in Actions)
+				{
+					if (action.ActionType == ActionType.Compile || action.ActionType == ActionType.Link)
+					{
+						CompilerPath = action.CommandPath;
+						break;
+					}
+				}
+
+				if (CompilerPath == null)
+				{
+					throw new BuildException("cannot detect Android compiler path");
+				}
+
+				AddText("Compiler('UE4Compiler') \n{\n");
+				AddText(string.Format("\t.Root = '{0}'\n", Path.GetDirectoryName(CompilerPath)));
+				AddText(string.Format("\t.Executable = '$Root$/{0}'\n", Path.GetFileName(CompilerPath)));
+				AddText("}\n\n");
 			}
 
 			if (envVars.ContainsKey("SCE_ORBIS_SDK_DIR"))
@@ -767,7 +818,13 @@ namespace UnrealBuildTool
 					else
 					{
 						AddText(string.Format("\t.CompilerOptions = '{0} -o \"%2\" \"%1\" '\n", OtherCompilerOptions));
-						CompilerOutputExtension = ".cpp.o";
+						int extensionIndex = OutputObjectFileName.LastIndexOf(".cpp");
+						if (extensionIndex < 0)
+						{
+							extensionIndex = OutputObjectFileName.LastIndexOf(".c");
+						}
+
+						CompilerOutputExtension = OutputObjectFileName.Substring(extensionIndex);
 					}
 				}
 			}
@@ -917,7 +974,7 @@ namespace UnrealBuildTool
 				AddText(string.Format("\t.LibrarianOutput = '{0}' \n", OutputFile));
 				AddText(string.Format("}}\n\n"));
 			}
-			else if (Action.CommandPath.Contains("link.exe") || Action.CommandPath.Contains("orbis-clang"))
+			else if (Action.CommandPath.Contains("link.exe") || Action.CommandPath.Contains("orbis-clang") || Action.CommandPath.Contains("clang++"))
 			{
 				if (DependencyIndices.Count > 0) //Insert a dummy node to make sure all of the dependencies are finished.
 												 //If FASTBuild supports PreBuildDependencies on the Executable action we can remove this.
@@ -986,7 +1043,7 @@ namespace UnrealBuildTool
 			{
 				bffOutputFileStream = new FileStream(BffFilePath, FileMode.Create, FileAccess.Write);
 
-				WriteEnvironmentSetup(); //Compiler, environment variables and base paths
+				WriteEnvironmentSetup(Actions); //Compiler, environment variables and base paths
 
 				int numFastBuildActions = 0;
 
@@ -1062,7 +1119,8 @@ namespace UnrealBuildTool
 			//Interesting flags for FASTBuild: -nostoponerror, -verbose, -monitor (if FASTBuild Monitor Visual Studio Extension is installed!)
 			// Yassine: The -clean is to bypass the FastBuild internal dependencies checks (cached in the fdb) as it could create some conflicts with UBT.
 			//			Basically we want FB to stupidly compile what UBT tells it to.
-			string FBCommandLine = string.Format("-monitor -summary {0} {1} -ide -clean -config {2}", distArgument, cacheArgument, BffFilePath);
+			string FBCommandLine = string.Format("-monitor -summary {0} {1} -ide -clean -distverbose -nostoponerror -config \"{2}\"", distArgument, cacheArgument, BffFilePath);
+			Console.WriteLine("Executing " + FBCommandLine);
 
 			ProcessStartInfo FBStartInfo = new ProcessStartInfo(string.IsNullOrEmpty(FBuildExePathOverride) ? "fbuild" : FBuildExePathOverride, FBCommandLine);
 
